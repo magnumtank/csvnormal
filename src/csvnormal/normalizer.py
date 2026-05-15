@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 from csvnormal import logger as log
 from csvnormal.ai_mapper import MappingResult
 from csvnormal.config import (
+    ALL_PRESERVE_FIELDS,
     CANONICAL_FIELDS,
     DEFAULT_CURRENCY,
     FIELD_GROUPS,
@@ -31,8 +33,47 @@ from csvnormal.config import (
 from csvnormal.date_resolver import DateResolution
 from csvnormal.table_detector import DetectedTable
 
-# Fields whose values must never be touched regardless of what they contain
-_PRESERVE = frozenset(CANONICAL_FIELDS)  # all canonical fields are preserved as-is
+# Set of canonical fields whose string values must be clean numbers
+_NUMERIC_FIELDS = frozenset(ALL_PRESERVE_FIELDS)
+
+# ── Numeric string cleaner ────────────────────────────────────────────────────
+
+# Leading currency symbols and spaces
+_RE_LEADING = re.compile(r"^[\s₹$€£¥₩₦₨฿₫₴₪]+")
+# Trailing: %, x (ROAS multiplier), whitespace
+_RE_TRAILING = re.compile(r"[%x\s]+$", re.IGNORECASE)
+# Thousand-separator commas: comma followed by one or more digits (not a decimal comma)
+_RE_THOUSAND_COMMA = re.compile(r",(?=\d)")
+
+
+def _strip_numeric_formatting(value: str) -> str:
+    """
+    Strip currency symbols, percentage signs, ROAS 'x' suffix, and
+    thousand-separator commas from a numeric field value.
+
+    Returns the cleaned string when it still represents a valid number.
+    Returns the original (stripped of leading/trailing whitespace only)
+    when cleaning produces a non-numeric result — so identity strings
+    like 'N/A' or '-' are never corrupted.
+
+    Never uses float() for the output value — decimal precision is preserved
+    exactly as written in the source file.
+    """
+    v = value.strip()
+    if not v:
+        return v
+
+    cleaned = _RE_LEADING.sub("", v)
+    cleaned = _RE_TRAILING.sub("", cleaned)
+    cleaned = _RE_THOUSAND_COMMA.sub("", cleaned)
+    cleaned = cleaned.strip()
+
+    # Accept only if the result is a valid number (integer or decimal, optional sign)
+    try:
+        float(cleaned)
+        return cleaned
+    except ValueError:
+        return v  # leave non-numeric values (N/A, -, —) untouched
 
 
 # ── Output models ─────────────────────────────────────────────────────────────
@@ -154,11 +195,13 @@ def normalize_table(
     for raw_row in table.data_rows:
         row_data: dict[str, str] = {}
 
-        # Copy mapped source columns (exact string — no coercion)
+        # Copy mapped source columns
         for src_idx, canon in col_map.items():
             if canon is None:
                 continue
             value = raw_row.cells[src_idx] if src_idx < len(raw_row.cells) else ""
+            if canon in _NUMERIC_FIELDS:
+                value = _strip_numeric_formatting(value)
             # Last-write-wins for duplicate source→same canonical
             if canon not in row_data or value:
                 row_data[canon] = value

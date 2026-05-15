@@ -128,18 +128,60 @@ class TestNormalizeBasic:
         result = normalize_table(table, mapping)
         assert result.row_count == 3
 
-    def test_numeric_values_preserved_exactly(self):
-        """Critical: numeric strings must survive unchanged."""
-        header = ["Spend", "CTR", "CPM"]
-        rows = [["1,25,000.50", "2.86%", "127.55"]]
+    def test_numeric_formatting_stripped(self):
+        """Formatting characters are stripped; the underlying number is preserved exactly."""
+        header = ["Spend", "CTR", "CPM", "Revenue"]
+        rows = [["1,25,000.50", "2.86%", "127.55", "₹1,250,000.00"]]
         table = _make_table(header, rows)
-        mapping = _make_mapping(header, {"Spend": "spend", "CTR": "ctr", "CPM": "cpm"})
+        mapping = _make_mapping(header, {
+            "Spend": "spend", "CTR": "ctr", "CPM": "cpm", "Revenue": "revenue"
+        })
 
         result = normalize_table(table, mapping)
         row = result.rows[0].data
-        assert row["spend"] == "1,25,000.50"
-        assert row["ctr"] == "2.86%"
+        # Thousand-separator commas stripped, value preserved
+        assert row["spend"] == "125000.50"
+        # Percentage sign stripped
+        assert row["ctr"] == "2.86"
+        # Already clean — unchanged
         assert row["cpm"] == "127.55"
+        # Currency symbol + commas stripped
+        assert row["revenue"] == "1250000.00"
+
+    def test_non_numeric_values_left_intact(self):
+        """N/A, dashes, and similar placeholders are not corrupted."""
+        header = ["Spend", "Conversions"]
+        rows = [["N/A", "-"]]
+        table = _make_table(header, rows)
+        mapping = _make_mapping(header, {"Spend": "spend", "Conversions": "conversions"})
+
+        result = normalize_table(table, mapping)
+        row = result.rows[0].data
+        assert row["spend"] == "N/A"
+        assert row["conversions"] == "-"
+
+    def test_decimal_precision_preserved(self):
+        """No float() conversion — trailing zeros and long decimals survive exactly."""
+        header = ["ROAS", "CPM", "Spend"]
+        rows = [["10.00", "127.550000", "999999.999"]]
+        table = _make_table(header, rows)
+        mapping = _make_mapping(header, {"ROAS": "roas", "CPM": "cpm", "Spend": "spend"})
+
+        result = normalize_table(table, mapping)
+        row = result.rows[0].data
+        assert row["roas"] == "10.00"
+        assert row["cpm"] == "127.550000"
+        assert row["spend"] == "999999.999"
+
+    def test_roas_x_suffix_stripped(self):
+        """ROAS values written as '10.00x' have the 'x' stripped."""
+        header = ["ROAS"]
+        rows = [["10.00x"]]
+        table = _make_table(header, rows)
+        mapping = _make_mapping(header, {"ROAS": "roas"})
+
+        result = normalize_table(table, mapping)
+        assert result.rows[0].data["roas"] == "10.00"
 
     def test_all_canonical_fields_in_csv_output(self):
         """to_csv_string must emit ALL canonical fields as columns."""
