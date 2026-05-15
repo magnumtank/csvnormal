@@ -534,16 +534,129 @@ def _save_mapping(result: "MappingResult", source_file: Path) -> None:
 @app.command()
 def normalize(
     file: Path = typer.Argument(..., help="CSV file to normalize."),
-    mapping: Optional[Path] = typer.Option(None, "--mapping", "-m", help="Mapping JSON file."),
+    mapping_file: Optional[Path] = typer.Option(None, "--mapping", "-m", help="Mapping JSON file (skips AI call)."),
+    client: str = typer.Option("", "--client", "-c", help="Client / advertiser name."),
+    table: Optional[int] = typer.Option(None, "--table", "-t", help="Only normalize this table index."),
+    retries: int = typer.Option(3, "--retries", "-r", help="AI retry budget (ignored with --mapping)."),
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Override output directory."),
+    no_ai: bool = typer.Option(False, "--no-ai", help="Skip AI mapping — requires --mapping file."),
 ) -> None:
-    """Apply deterministic mappings and produce canonical CSV. [Phase 5+]"""
-    log.rule("normalize")
+    """Load CSV, map columns via AI (or provided mapping), and write canonical CSV + audit JSON."""
+    import json as _json
+
+    from csvnormal.ai_mapper import MappingResult, map_table
+    from csvnormal.normalizer import NormalizeResult, normalize_table, write_audit_json, write_canonical_csv
+
+    log.rule(f"normalize  {file.name}")
     if not file.exists():
         log.error(f"File not found: {file}")
         raise typer.Exit(1)
-    log.info(f"Target file: [bold]{file}[/bold]")
-    log.warning("normalize command will be implemented in Phase 5 — Deterministic Normalization.")
+
+    out_dir = output_dir or settings.output_dir
+
+    # ── Load and detect ───────────────────────────────────────────────────────
+    log.info(f"Loading [bold]{file}[/bold] …")
+    try:
+        raw = load_raw(file)
+    except Exception as exc:
+        log.error(f"Failed to load: {exc}")
+        raise typer.Exit(1)
+
+    detection = detect_tables(raw)
+    if detection.total_tables == 0:
+        log.error("No tables detected — nothing to normalize.")
+        raise typer.Exit(1)
+
+    # ── Date resolution ───────────────────────────────────────────────────────
+    date_res = resolve_dates(file, raw)
+
+    # ── Load or acquire mapping ───────────────────────────────────────────────
+    preloaded_mapping: Optional[MappingResult] = None
+    if mapping_file:
+        if not mapping_file.exists():
+            log.error(f"Mapping file not found: {mapping_file}")
+            raise typer.Exit(1)
+        try:
+            data = _json.loads(mapping_file.read_text(encoding="utf-8"))
+            payload = data.get("mapping", data)
+            preloaded_mapping = MappingResult.model_validate(payload)
+            log.info(f"Loaded mapping from [bold]{mapping_file.name}[/bold]")
+        except Exception as exc:
+            log.error(f"Failed to parse mapping file: {exc}")
+            raise typer.Exit(1)
+
+    if no_ai and preloaded_mapping is None:
+        log.error("--no-ai requires a --mapping file.")
+        raise typer.Exit(1)
+
+    # ── Process tables ────────────────────────────────────────────────────────
+    tables_to_process = (
+        [detection.tables[table]] if table is not None else detection.tables
+    )
+
+    normalize_results: list[NormalizeResult] = []
+    mapping_results: list[MappingResult] = []
+
+    for tbl in tables_to_process:
+        log.blank()
+        log.rule(f"Table {tbl.table_index} — {tbl.row_count} rows, {tbl.column_count} columns")
+        if tbl.section_title:
+            log.info(f"Section: [bold]{tbl.section_title}[/bold]")
+
+        if preloaded_mapping is not None:
+            mapping_result = preloaded_mapping
+            log.info("Using pre-loaded mapping.")
+        else:
+            log.info("Requesting AI column mapping …")
+            try:
+                mapping_result = map_table(tbl, source_file=file, max_retries=retries)
+            except RuntimeError as exc:
+                log.error(str(exc))
+                raise typer.Exit(1)
+
+        mapping_results.append(mapping_result)
+
+        norm = normalize_table(
+            table=tbl,
+            mapping=mapping_result,
+            date_resolution=date_res,
+            client_name=client,
+        )
+        normalize_results.append(norm)
+
+        _print_normalize_summary(norm)
+
+        stem = f"{file.stem}_table{tbl.table_index}"
+        csv_path = out_dir / f"{stem}_canonical.csv"
+        audit_path = out_dir / f"{stem}_audit.json"
+        write_canonical_csv(norm, csv_path)
+        write_audit_json(norm, mapping_result, audit_path)
+
     log.blank()
+    log.success(
+        f"Normalization complete — {len(normalize_results)} table(s). "
+        f"Output in [bold]{out_dir}/[/bold]"
+    )
+    log.blank()
+
+
+# ── normalize renderers ───────────────────────────────────────────────────────
+
+
+def _print_normalize_summary(norm: "NormalizeResult") -> None:  # type: ignore[name-defined]
+    log.blank()
+    log.info(
+        f"  [bold]{norm.row_count}[/bold] rows normalized → "
+        f"[bold]{norm.column_count}[/bold] canonical columns used"
+    )
+    if norm.skipped_source_columns:
+        log.info(f"  Skipped columns : {norm.skipped_source_columns}")
+    if norm.unknown_source_columns:
+        log.warning(f"  Unknown columns : {norm.unknown_source_columns}")
+    for w in norm.warnings:
+        log.warning(f"  {w.message}")
+    if norm.date_resolution_source not in ("csv_column", "none"):
+        log.info(f"  Date source     : {norm.date_resolution_source}")
 
 
 # ── validate ──────────────────────────────────────────────────────────────────
