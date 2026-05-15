@@ -391,16 +391,20 @@ def map_cmd(
     table: Optional[int] = typer.Option(None, "--table", "-t", help="Only map this table index."),
     retries: int = typer.Option(3, "--retries", "-r", help="AI retry budget."),
     save: bool = typer.Option(True, "--save/--no-save", help="Save mapping JSON to output/."),
+    no_memory: bool = typer.Option(False, "--no-memory", help="Skip memory lookup; always call AI."),
 ) -> None:
     """Send headers + sample rows to AI, receive and validate column mapping JSON."""
     import json as _json
 
     from csvnormal.ai_mapper import MappingResult, map_table
+    from csvnormal.memory import MappingMemory
 
     log.rule(f"map  {file.name}")
     if not file.exists():
         log.error(f"File not found: {file}")
         raise typer.Exit(1)
+
+    memory = MappingMemory()
 
     # ── Phase 2+3: load and detect tables ────────────────────────────────────
     log.info(f"Loading [bold]{file}[/bold] …")
@@ -418,7 +422,6 @@ def map_cmd(
 
     log.info(f"Detected [bold]{detection.total_tables}[/bold] table(s).")
 
-    # Filter to requested table(s)
     tables_to_map = (
         [detection.tables[table]]
         if table is not None
@@ -433,11 +436,22 @@ def map_cmd(
         if tbl.section_title:
             log.info(f"Section: [bold]{tbl.section_title}[/bold]")
 
-        try:
-            result = map_table(tbl, source_file=file, max_retries=retries)
-        except RuntimeError as exc:
-            log.error(str(exc))
-            raise typer.Exit(1)
+        # ── Memory lookup (Phase 8) ───────────────────────────────────────────
+        result: MappingResult | None = None
+        if not no_memory and memory.covers_header(tbl.header_row):
+            log.info(
+                "[bold green]Memory hit[/bold green] — all columns known; skipping AI call."
+            )
+            result = _mapping_from_memory(memory, tbl, file)
+
+        if result is None:
+            try:
+                result = map_table(tbl, source_file=file, max_retries=retries)
+            except RuntimeError as exc:
+                log.error(str(exc))
+                raise typer.Exit(1)
+            memory.record_from_mapping(result, source="ai")
+            memory.save()
 
         results.append(result)
         _print_mapping_result(result)
@@ -526,6 +540,50 @@ def _save_mapping(result: "MappingResult", source_file: Path) -> None:
     out_path = settings.output_dir / f"{stem}_table{result.table_index}_mapping.json"
     out_path.write_text(_json.dumps(result.to_audit_dict(), indent=2, default=str))
     log.success(f"Mapping saved → [bold]{out_path}[/bold]")
+
+
+def _mapping_from_memory(
+    memory: "MappingMemory",  # type: ignore[name-defined]
+    tbl: "DetectedTable",
+    source_file: Path,
+) -> "MappingResult":
+    """Build a MappingResult entirely from memory entries (no AI call)."""
+    from datetime import UTC, datetime
+
+    from csvnormal.ai_mapper import ColumnMappingEntry, MappingResult
+    from csvnormal.memory import MappingMemory
+    from csvnormal.prompts import PROMPT_VERSION
+
+    col_map = {}
+    for col in tbl.header_row:
+        entry = memory.lookup_column(col)
+        if entry:
+            col_map[col] = ColumnMappingEntry(
+                canonical=entry.canonical,
+                confidence=entry.confidence,
+                reason=f"memory ({entry.source})",
+            )
+        else:
+            col_map[col] = ColumnMappingEntry(
+                canonical="__unknown__",
+                confidence=0.0,
+                reason="not in memory",
+            )
+
+    return MappingResult(
+        source_file=source_file.name,
+        table_index=tbl.table_index,
+        section_title=tbl.section_title,
+        mapped_at=datetime.now(UTC).isoformat(),
+        model_used="memory",
+        prompt_version=PROMPT_VERSION,
+        table_type="unknown",
+        column_mapping=col_map,
+        platform_mapping={},
+        warnings=["Mapping sourced from memory — no AI call made."],
+        overall_confidence=min(e.confidence for e in col_map.values()),
+        raw_response="",
+    )
 
 
 # ── normalize ─────────────────────────────────────────────────────────────────
@@ -775,15 +833,156 @@ def _print_validation_report(report: "ValidationReport") -> None:  # type: ignor
 
 @app.command()
 def review(
-    mapping: Path = typer.Argument(..., help="Mapping JSON file to review."),
+    mapping_file: Path = typer.Argument(..., help="Mapping JSON file to review."),
+    threshold: float = typer.Option(0.75, "--threshold", "-t", help="Confidence threshold — columns below this are flagged."),
+    all_columns: bool = typer.Option(False, "--all", "-a", help="Review every column, not just low-confidence ones."),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save corrected mapping back to the same JSON file."),
 ) -> None:
-    """Terminal-based manual mapping review and override workflow. [Phase 7+]"""
-    log.rule("review")
-    if not mapping.exists():
-        log.error(f"File not found: {mapping}")
+    """Interactively review and correct AI column mappings; corrections are saved to memory."""
+    import json as _json
+
+    from csvnormal.ai_mapper import MappingResult
+    from csvnormal.memory import MappingMemory
+    from csvnormal.review import run_review
+
+    log.rule(f"review  {mapping_file.name}")
+    if not mapping_file.exists():
+        log.error(f"File not found: {mapping_file}")
         raise typer.Exit(1)
-    log.info(f"Mapping file: [bold]{mapping}[/bold]")
-    log.warning("review command will be implemented in Phase 7 — Terminal Review Workflow.")
+
+    # Load mapping
+    try:
+        data = _json.loads(mapping_file.read_text(encoding="utf-8"))
+        payload = data.get("mapping", data)
+        mapping_result = MappingResult.model_validate(payload)
+    except Exception as exc:
+        log.error(f"Failed to parse mapping file: {exc}")
+        raise typer.Exit(1)
+
+    log.info(
+        f"Loaded mapping: [bold]{len(mapping_result.column_mapping)}[/bold] columns, "
+        f"table type: [bold]{mapping_result.table_type}[/bold], "
+        f"overall confidence: [bold]{mapping_result.overall_confidence:.0%}[/bold]"
+    )
+    log.blank()
+
+    memory = MappingMemory()
+
+    # Run interactive review
+    updated_mapping, overridden = run_review(
+        mapping=mapping_result,
+        threshold=threshold,
+        review_all=all_columns,
+    )
+
+    # Record everything to memory (user corrections + accepted AI decisions)
+    for col, entry in updated_mapping.column_mapping.items():
+        src = "user" if col in overridden else "ai"
+        memory.record_column(col, entry.canonical, entry.confidence, source=src)
+    memory.save()
+
+    if overridden:
+        log.info(f"Memory updated with {len(overridden)} user correction(s).")
+
+    # Save corrected mapping back to file
+    if save and overridden:
+        mapping_file.write_text(
+            _json.dumps(updated_mapping.to_audit_dict(), indent=2, default=str),
+            encoding="utf-8",
+        )
+        log.success(f"Corrected mapping saved → [bold]{mapping_file}[/bold]")
+    elif not overridden:
+        log.info("No changes — mapping file unchanged.")
+
+    log.blank()
+
+
+# ── memory subcommand group ───────────────────────────────────────────────────
+
+memory_app = typer.Typer(name="memory", help="Inspect and manage the column mapping memory.", no_args_is_help=True)
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command(name="stats")
+def memory_stats() -> None:
+    """Show summary statistics for the mapping memory."""
+    from csvnormal.memory import MappingMemory
+
+    mem = MappingMemory()
+    s = mem.stats()
+    log.rule("Mapping Memory — Stats")
+    log.info(f"  Total entries     : [bold]{s['total']}[/bold]")
+    log.info(f"  User corrections  : [bold cyan]{s['user_corrections']}[/bold cyan]")
+    log.info(f"  AI decisions      : [bold]{s['ai_decisions']}[/bold]")
+    log.info(f"  File              : [dim]{mem._path}[/dim]")
+    log.blank()
+
+
+@memory_app.command(name="list")
+def memory_list(
+    limit: int = typer.Option(50, "--limit", "-n", help="Max entries to show."),
+    user_only: bool = typer.Option(False, "--user-only", help="Show only user corrections."),
+) -> None:
+    """List all remembered column → canonical mappings."""
+    from csvnormal.memory import MappingMemory
+
+    mem = MappingMemory()
+    entries = mem.list_entries()
+
+    if user_only:
+        entries = [(k, v) for k, v in entries if v.source == "user"]
+
+    log.rule(f"Mapping Memory — {len(entries)} entries")
+    if not entries:
+        log.info("  Memory is empty.")
+        log.blank()
+        return
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    tbl.add_column("Normalized key",  width=28)
+    tbl.add_column("→ Canonical",     width=22)
+    tbl.add_column("Conf",            width=6,  justify="right")
+    tbl.add_column("Source",          width=8)
+    tbl.add_column("Used",            width=6,  justify="right")
+    tbl.add_column("Last seen",       width=12)
+
+    for key, entry in entries[:limit]:
+        style = "cyan" if entry.source == "user" else ""
+        tbl.add_row(
+            key,
+            entry.canonical,
+            f"{entry.confidence:.2f}",
+            f"[cyan]{entry.source}[/cyan]" if entry.source == "user" else entry.source,
+            str(entry.usage_count),
+            entry.last_seen,
+            style=style,
+        )
+
+    log.console.print(tbl)
+    if len(entries) > limit:
+        log.info(f"  … and {len(entries) - limit} more. Use --limit to see more.")
+    log.blank()
+
+
+@memory_app.command(name="clear")
+def memory_clear(
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
+) -> None:
+    """Delete all entries from the mapping memory."""
+    from csvnormal.memory import MappingMemory
+
+    mem = MappingMemory()
+    s = mem.stats()
+
+    if not confirm:
+        typer.confirm(
+            f"This will delete all {s['total']} memory entries. Continue?",
+            abort=True,
+        )
+
+    mem.clear()
+    mem.save()
+    log.success("Memory cleared.")
     log.blank()
 
 
