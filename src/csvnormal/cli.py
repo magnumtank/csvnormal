@@ -388,15 +388,144 @@ def _print_table_details(det: TableDetectionResult, verbose: bool) -> None:
 @app.command(name="map")
 def map_cmd(
     file: Path = typer.Argument(..., help="CSV file to map."),
+    table: Optional[int] = typer.Option(None, "--table", "-t", help="Only map this table index."),
+    retries: int = typer.Option(3, "--retries", "-r", help="AI retry budget."),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save mapping JSON to output/."),
 ) -> None:
-    """Send headers + sample rows to AI, receive column mapping JSON. [Phase 4+]"""
-    log.rule("map")
+    """Send headers + sample rows to AI, receive and validate column mapping JSON."""
+    import json as _json
+
+    from csvnormal.ai_mapper import MappingResult, map_table
+
+    log.rule(f"map  {file.name}")
     if not file.exists():
         log.error(f"File not found: {file}")
         raise typer.Exit(1)
-    log.info(f"Target file: [bold]{file}[/bold]")
-    log.warning("map command will be implemented in Phase 4 — AI Mapping Layer.")
+
+    # ── Phase 2+3: load and detect tables ────────────────────────────────────
+    log.info(f"Loading [bold]{file}[/bold] …")
+    try:
+        raw = load_raw(file)
+    except Exception as exc:
+        log.error(f"Failed to load: {exc}")
+        raise typer.Exit(1)
+
+    detection = detect_tables(raw)
+
+    if detection.total_tables == 0:
+        log.error("No tables detected — nothing to map.")
+        raise typer.Exit(1)
+
+    log.info(f"Detected [bold]{detection.total_tables}[/bold] table(s).")
+
+    # Filter to requested table(s)
+    tables_to_map = (
+        [detection.tables[table]]
+        if table is not None
+        else detection.tables
+    )
+
+    results: list[MappingResult] = []
+
+    for tbl in tables_to_map:
+        log.blank()
+        log.rule(f"Table {tbl.table_index} — {tbl.row_count} data rows, {tbl.column_count} columns")
+        if tbl.section_title:
+            log.info(f"Section: [bold]{tbl.section_title}[/bold]")
+
+        try:
+            result = map_table(tbl, source_file=file, max_retries=retries)
+        except RuntimeError as exc:
+            log.error(str(exc))
+            raise typer.Exit(1)
+
+        results.append(result)
+        _print_mapping_result(result)
+
+        if save:
+            _save_mapping(result, file)
+
     log.blank()
+    log.success(
+        f"Mapping complete — {len(results)} table(s) mapped. "
+        + (f"Files saved to [bold]{settings.output_dir}/[/bold]" if save else "")
+    )
+    log.blank()
+
+
+# ── map renderers ─────────────────────────────────────────────────────────────
+
+
+def _print_mapping_result(r: "MappingResult") -> None:
+    from csvnormal.ai_mapper import MappingResult
+
+    log.blank()
+    log.rule("Column Mappings")
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    tbl.add_column("Source column", style="bold white", width=26)
+    tbl.add_column("→ Canonical field", width=22)
+    tbl.add_column("Conf", width=6, justify="right")
+    tbl.add_column("Reason", width=36)
+
+    conf_colours = {"__skip__": "dim", "__unknown__": "red"}
+    for src_col, entry in r.column_mapping.items():
+        canon = entry.canonical
+        colour = conf_colours.get(canon, "green" if entry.confidence >= 0.8 else "yellow")
+        tbl.add_row(
+            src_col,
+            f"[{colour}]{canon}[/{colour}]",
+            f"{entry.confidence:.0%}",
+            entry.reason,
+        )
+
+    log.console.print(tbl)
+
+    if r.platform_mapping:
+        log.blank()
+        log.rule("Platform Mappings")
+        ptbl = Table(show_header=True, header_style="bold cyan")
+        ptbl.add_column("Source value", style="bold white", width=26)
+        ptbl.add_column("→ Canonical platform", width=22)
+        ptbl.add_column("Conf", width=6, justify="right")
+
+        for src_val, entry in r.platform_mapping.items():
+            colour = "dim" if entry.canonical == "__unknown__" else "green"
+            ptbl.add_row(
+                src_val,
+                f"[{colour}]{entry.canonical}[/{colour}]",
+                f"{entry.confidence:.0%}",
+            )
+        log.console.print(ptbl)
+
+    if r.warnings:
+        log.blank()
+        log.rule("AI Warnings")
+        for w in r.warnings:
+            log.warning(w)
+
+    if r.unknown_columns:
+        log.blank()
+        log.warning(
+            f"Unknown columns (need manual review): [bold]{', '.join(r.unknown_columns)}[/bold]"
+        )
+
+    conf_colour = "green" if r.overall_confidence >= 0.8 else "yellow" if r.overall_confidence >= 0.6 else "red"
+    log.blank()
+    log.console.print(
+        f"  Overall confidence : [{conf_colour}]{r.overall_confidence:.0%}[/{conf_colour}]   "
+        f"Table type : [bold]{r.table_type}[/bold]   "
+        f"Model : [dim]{r.model_used}[/dim]"
+    )
+
+
+def _save_mapping(result: "MappingResult", source_file: Path) -> None:
+    import json as _json
+
+    stem = source_file.stem
+    out_path = settings.output_dir / f"{stem}_table{result.table_index}_mapping.json"
+    out_path.write_text(_json.dumps(result.to_audit_dict(), indent=2, default=str))
+    log.success(f"Mapping saved → [bold]{out_path}[/bold]")
 
 
 # ── normalize ─────────────────────────────────────────────────────────────────

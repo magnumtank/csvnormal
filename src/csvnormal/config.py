@@ -254,6 +254,10 @@ PLATFORM_ALIASES: dict[str, str] = {
     "asa": "apple",
 }
 
+# ── Canonical platform keys (unique values, sorted) ──────────────────────────
+
+CANONICAL_PLATFORMS: list[str] = sorted(set(PLATFORM_ALIASES.values()))
+
 # ── AI model settings ─────────────────────────────────────────────────────────
 
 AI_MODEL: str = os.getenv("CSVNORMAL_MODEL", "claude-sonnet-4-6")
