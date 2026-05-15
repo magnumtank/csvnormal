@@ -265,11 +265,11 @@ def test_inspect_missing_file():
     assert result.exit_code == 1
 
 
-def test_inspect_warns_phase_not_ready():
+def test_inspect_runs_successfully():
     fixture = FIXTURES / "single_table_clean.csv"
     result = runner.invoke(app, ["inspect", str(fixture)])
     assert result.exit_code == 0
-    assert "Phase 2" in result.output or "WARN" in result.output
+    assert "data rows" in result.output
 
 
 def test_map_warns_phase_not_ready():

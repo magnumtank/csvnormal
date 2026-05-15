@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from csvnormal import __version__
 from csvnormal import logger as log
@@ -21,6 +23,8 @@ from csvnormal.config import (
     REQUIRED_FIELDS,
     settings,
 )
+from csvnormal.date_resolver import resolve_dates
+from csvnormal.ingestion import InspectResult, RowKind, load_raw
 
 app = typer.Typer(
     name="csvnormal",
@@ -56,15 +60,216 @@ def main(
 @app.command()
 def inspect(
     file: Path = typer.Argument(..., help="CSV file to inspect."),
+    sample: int = typer.Option(5, "--sample", "-n", help="Number of data rows to preview."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show all warnings."),
 ) -> None:
-    """Detect tables, preview structure, show warnings. [Phase 2+]"""
-    log.rule("inspect")
+    """Detect tables, preview structure, show warnings."""
+    log.rule(f"inspect  {file.name}")
     if not file.exists():
         log.error(f"File not found: {file}")
         raise typer.Exit(1)
-    log.info(f"Target file: [bold]{file}[/bold]")
-    log.warning("inspect command will be implemented in Phase 2 — CSV Ingestion.")
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+    log.info(f"Loading [bold]{file}[/bold] …")
+    try:
+        result = load_raw(file)
+    except Exception as exc:
+        log.error(f"Failed to load file: {exc}")
+        raise typer.Exit(1)
+
+    _print_file_info(result)
+    _print_structure(result)
+    _print_row_breakdown(result)
+    _print_warnings(result, verbose=verbose)
+    _print_missing_values(result, verbose=verbose)
+    _print_sample_data(result, n=sample)
+    _print_date_resolution(file, result)
+
     log.blank()
+    log.success(f"Inspection complete — {len(result.data_rows)} data rows, "
+                f"{len(result.warnings)} structural warnings, "
+                f"{len(result.missing_value_warnings)} missing-value warnings.")
+    log.blank()
+
+
+# ── inspect sub-renderers ─────────────────────────────────────────────────────
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 ** 2:.1f} MB"
+
+
+def _print_file_info(r: InspectResult) -> None:
+    log.blank()
+    log.rule("File Info")
+    log.info(f"Path      : [bold]{r.path}[/bold]")
+    log.info(f"Size      : [bold]{_fmt_bytes(r.file_size_bytes)}[/bold]")
+    conf_colour = "green" if r.encoding_confidence >= 0.9 else "yellow"
+    log.info(
+        f"Encoding  : [bold]{r.encoding.upper()}[/bold]  "
+        f"[{conf_colour}](confidence: {r.encoding_confidence:.0%})[/{conf_colour}]"
+    )
+
+
+def _print_structure(r: InspectResult) -> None:
+    log.blank()
+    log.rule("Header")
+    log.info(f"Detected at line [bold]{r.header_line_number}[/bold] — "
+             f"[bold]{len(r.header_row)}[/bold] column(s)")
+
+    # Show header columns in a compact table
+    tbl = Table(show_header=False, box=None, padding=(0, 1))
+    tbl.add_column("idx", style="dim", width=4)
+    tbl.add_column("name", style="bold white")
+
+    for i, col in enumerate(r.header_row):
+        tbl.add_row(str(i), col)
+
+    log.console.print(tbl)
+
+    # Date column status
+    if r.has_date_column:
+        log.success(f"Date column detected: [bold]{r.date_column_name}[/bold]")
+    else:
+        log.warning("No date column found — period will be resolved from filename or user input")
+
+
+def _print_row_breakdown(r: InspectResult) -> None:
+    log.blank()
+    log.rule("Row Breakdown")
+
+    kind_styles = {
+        RowKind.DATA:           ("data",           "green"),
+        RowKind.BLANK:          ("blank",          "dim"),
+        RowKind.NOTE:           ("note",           "yellow"),
+        RowKind.SUBTOTAL:       ("subtotal",       "red"),
+        RowKind.HEADER_REPEAT:  ("header_repeat",  "cyan"),
+        RowKind.MALFORMED:      ("malformed",      "bold red"),
+    }
+
+    counts = {
+        RowKind.DATA:          len(r.data_rows),
+        RowKind.BLANK:         len(r.blank_rows),
+        RowKind.NOTE:          len(r.note_rows),
+        RowKind.SUBTOTAL:      len(r.subtotal_rows),
+        RowKind.HEADER_REPEAT: len(r.repeated_header_rows),
+        RowKind.MALFORMED:     len(r.malformed_rows),
+    }
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    tbl.add_column("Row type", width=18)
+    tbl.add_column("Count", justify="right", width=8)
+    tbl.add_column("Status", width=30)
+
+    for kind, (label, colour) in kind_styles.items():
+        count = counts[kind]
+        if kind == RowKind.DATA:
+            status = "[green]✓ will be normalized[/green]" if count else "[dim]none[/dim]"
+        elif count == 0:
+            status = "[dim]none[/dim]"
+        else:
+            status = f"[{colour}]⚠ will be skipped[/{colour}]"
+        tbl.add_row(f"[{colour}]{label}[/{colour}]", str(count), status)
+
+    log.console.print(tbl)
+
+
+def _print_warnings(r: InspectResult, verbose: bool) -> None:
+    if not r.warnings:
+        return
+    log.blank()
+    log.rule(f"Structural Warnings  ({len(r.warnings)})")
+
+    display = r.warnings if verbose else r.warnings[:10]
+    for w in display:
+        colour = {
+            RowKind.NOTE:           "yellow",
+            RowKind.BLANK:          "dim",
+            RowKind.SUBTOTAL:       "red",
+            RowKind.HEADER_REPEAT:  "cyan",
+            RowKind.MALFORMED:      "bold red",
+        }.get(w.kind, "yellow")
+        log.console.print(f"  [{colour}]line {w.line_number:>4}[/{colour}]  {w.message}")
+
+    if not verbose and len(r.warnings) > 10:
+        log.console.print(
+            f"  [dim]… {len(r.warnings) - 10} more warnings hidden — use --verbose to see all[/dim]"
+        )
+
+
+def _print_missing_values(r: InspectResult, verbose: bool) -> None:
+    if not r.missing_value_warnings:
+        return
+    log.blank()
+    log.rule(f"Missing Value Warnings  ({len(r.missing_value_warnings)})")
+
+    display = r.missing_value_warnings if verbose else r.missing_value_warnings[:10]
+    for mv in display:
+        cols = ", ".join(f"[bold]{c}[/bold]" for c in mv.empty_columns[:5])
+        if len(mv.empty_columns) > 5:
+            cols += f" + {len(mv.empty_columns) - 5} more"
+        log.console.print(f"  [yellow]line {mv.line_number:>4}[/yellow]  empty: {cols}")
+
+    if not verbose and len(r.missing_value_warnings) > 10:
+        log.console.print(
+            f"  [dim]… {len(r.missing_value_warnings) - 10} more — use --verbose to see all[/dim]"
+        )
+
+
+def _print_sample_data(r: InspectResult, n: int) -> None:
+    data = r.data_rows[:n]
+    if not data:
+        log.warning("No data rows found to preview.")
+        return
+
+    log.blank()
+    log.rule(f"Sample Data  (first {len(data)} of {len(r.data_rows)} data rows)")
+
+    # Cap columns shown at 10 to stay readable
+    display_headers = r.header_row[:10]
+    truncated = len(r.header_row) > 10
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    for h in display_headers:
+        tbl.add_column(h, no_wrap=False, max_width=18)
+    if truncated:
+        tbl.add_column(f"… +{len(r.header_row) - 10} cols", style="dim")
+
+    for row in data:
+        cells = row.cells[:10]
+        # Pad if row is shorter than header
+        while len(cells) < len(display_headers):
+            cells.append("")
+        row_vals = list(cells)
+        if truncated:
+            row_vals.append("…")
+        tbl.add_row(*row_vals)
+
+    log.console.print(tbl)
+
+
+def _print_date_resolution(file: Path, r: InspectResult) -> None:
+    log.blank()
+    log.rule("Date Resolution")
+    date_res = resolve_dates(file, has_date_column=r.has_date_column, interactive=False)
+
+    if date_res.source == "csv_column":
+        log.success(f"Date column [bold]{r.date_column_name}[/bold] present — no period resolution needed.")
+    elif date_res.source == "filename":
+        log.success(
+            f"Period resolved from filename: [bold]{date_res.month_label}[/bold]  "
+            f"([dim]{date_res.start_date} → {date_res.end_date}[/dim])"
+        )
+        log.info("Run [bold]csvnormal normalize[/bold] and the period will be filled automatically.")
+    else:
+        log.warning(
+            "Could not resolve date period from filename. "
+            "Run [bold]csvnormal normalize[/bold] to be prompted for the reporting period."
+        )
 
 
 # ── map ───────────────────────────────────────────────────────────────────────
