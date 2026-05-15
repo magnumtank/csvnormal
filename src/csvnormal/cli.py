@@ -664,15 +664,109 @@ def _print_normalize_summary(norm: "NormalizeResult") -> None:  # type: ignore[n
 
 @app.command()
 def validate(
-    file: Path = typer.Argument(..., help="Normalized CSV to validate."),
+    file: Path = typer.Argument(..., help="Canonical CSV to validate."),
+    audit: Optional[Path] = typer.Option(None, "--audit", "-a", help="Audit JSON sidecar (enables row-count check)."),
+    strict: bool = typer.Option(False, "--strict", help="Exit 1 on warnings too, not just errors."),
 ) -> None:
-    """Verify row counts, numeric integrity, required fields. [Phase 6+]"""
-    log.rule("validate")
+    """Verify row counts, numeric integrity, required fields, and value ranges."""
+    import json as _json
+
+    from csvnormal.validator import ValidationReport, load_canonical_csv, run_all_checks
+
+    log.rule(f"validate  {file.name}")
     if not file.exists():
         log.error(f"File not found: {file}")
         raise typer.Exit(1)
-    log.info(f"Target file: [bold]{file}[/bold]")
-    log.warning("validate command will be implemented in Phase 6 — Validation Engine.")
+
+    # ── Load canonical CSV ────────────────────────────────────────────────────
+    try:
+        header, rows = load_canonical_csv(file)
+    except Exception as exc:
+        log.error(f"Failed to read CSV: {exc}")
+        raise typer.Exit(1)
+
+    log.info(f"Loaded [bold]{len(rows)}[/bold] rows, [bold]{len(header)}[/bold] columns.")
+
+    # ── Try to find audit sidecar ─────────────────────────────────────────────
+    source_row_count: Optional[int] = None
+    audit_path = audit
+
+    # Auto-discover: same stem but _audit.json
+    if audit_path is None:
+        candidate = file.parent / file.name.replace("_canonical.csv", "_audit.json")
+        if candidate.exists():
+            audit_path = candidate
+            log.info(f"Auto-detected audit sidecar: [bold]{candidate.name}[/bold]")
+
+    if audit_path and audit_path.exists():
+        try:
+            data = _json.loads(audit_path.read_text(encoding="utf-8"))
+            norm = data.get("normalize", data)
+            source_row_count = norm.get("row_count")
+        except Exception:
+            log.warning("Could not parse audit JSON — skipping row count check.")
+
+    # ── Run checks ────────────────────────────────────────────────────────────
+    report = run_all_checks(rows, source_file=file.name, source_row_count=source_row_count)
+
+    _print_validation_report(report)
+
+    # ── Exit code ─────────────────────────────────────────────────────────────
+    if not report.passed:
+        log.error(
+            f"Validation failed — {report.error_count} error(s), "
+            f"{report.warning_count} warning(s)."
+        )
+        raise typer.Exit(1)
+
+    if strict and report.warning_count > 0:
+        log.error(f"Strict mode: {report.warning_count} warning(s) treated as errors.")
+        raise typer.Exit(1)
+
+    log.success(
+        f"Validation passed — {report.error_count} error(s), "
+        f"{report.warning_count} warning(s)."
+    )
+    log.blank()
+
+
+# ── validate renderer ─────────────────────────────────────────────────────────
+
+
+def _print_validation_report(report: "ValidationReport") -> None:  # type: ignore[name-defined]
+    from csvnormal.validator import Severity
+
+    log.blank()
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    tbl.add_column("Check", style="bold white", width=24)
+    tbl.add_column("Result", width=8, justify="center")
+    tbl.add_column("Details", width=60)
+
+    icons = {
+        (True,  Severity.ERROR):   ("[green]PASS[/green]",   "green"),
+        (True,  Severity.WARNING): ("[green]PASS[/green]",   "green"),
+        (True,  Severity.INFO):    ("[cyan]INFO[/cyan]",     "cyan"),
+        (False, Severity.ERROR):   ("[red]FAIL[/red]",       "red"),
+        (False, Severity.WARNING): ("[yellow]WARN[/yellow]", "yellow"),
+        (False, Severity.INFO):    ("[cyan]INFO[/cyan]",     "cyan"),
+    }
+
+    for check in report.checks:
+        icon_str, row_style = icons[(check.passed, check.severity)]
+        detail_text = check.message
+        if check.details:
+            detail_text += "\n" + "\n".join(f"  • {d}" for d in check.details[:5])
+            if len(check.details) > 5:
+                detail_text += f"\n  … and {len(check.details) - 5} more"
+        tbl.add_row(
+            check.name,
+            Text.from_markup(icon_str),
+            detail_text,
+            style=row_style if not check.passed else "",
+        )
+
+    log.console.print(tbl)
     log.blank()
 
 
