@@ -25,6 +25,7 @@ from csvnormal.config import (
 )
 from csvnormal.date_resolver import resolve_dates
 from csvnormal.ingestion import InspectResult, RowKind, load_raw
+from csvnormal.table_detector import DetectedTable, TableDetectionResult, detect_tables
 
 app = typer.Typer(
     name="csvnormal",
@@ -80,15 +81,24 @@ def inspect(
     _print_file_info(result)
     _print_structure(result)
     _print_row_breakdown(result)
+
+    # ── Table detection ───────────────────────────────────────────────────────
+    detection = detect_tables(result)
+    _print_tables_overview(detection)
+    _print_table_details(detection, verbose=verbose)
+
     _print_warnings(result, verbose=verbose)
     _print_missing_values(result, verbose=verbose)
     _print_sample_data(result, n=sample)
     _print_date_resolution(file, result)
 
     log.blank()
-    log.success(f"Inspection complete — {len(result.data_rows)} data rows, "
-                f"{len(result.warnings)} structural warnings, "
-                f"{len(result.missing_value_warnings)} missing-value warnings.")
+    log.success(
+        f"Inspection complete — "
+        f"{detection.total_tables} table(s) detected, "
+        f"{detection.total_data_rows} data rows, "
+        f"{len(result.warnings)} structural warnings."
+    )
     log.blank()
 
 
@@ -270,6 +280,106 @@ def _print_date_resolution(file: Path, r: InspectResult) -> None:
             "Could not resolve date period from filename. "
             "Run [bold]csvnormal normalize[/bold] to be prompted for the reporting period."
         )
+
+
+# ── table detection renderers ─────────────────────────────────────────────────
+
+
+def _print_tables_overview(det: TableDetectionResult) -> None:
+    log.blank()
+    log.rule(f"Tables Detected  ({det.total_tables})")
+
+    if not det.tables:
+        log.warning("No logical tables found — file may be empty or entirely non-data.")
+        return
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    tbl.add_column("Table", width=6, justify="center")
+    tbl.add_column("Header line", width=12, justify="right")
+    tbl.add_column("Cols", width=6, justify="right")
+    tbl.add_column("Data rows", width=10, justify="right")
+    tbl.add_column("Subtotals", width=10, justify="right")
+    tbl.add_column("Date col", width=12)
+    tbl.add_column("Confidence", width=14)
+    tbl.add_column("Section title", width=30)
+
+    conf_colour = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red", "VERY LOW": "bold red"}
+
+    for t in det.tables:
+        label = t.confidence_label
+        colour = conf_colour.get(label, "white")
+        date_info = (
+            f"[green]{t.date_column_name}[/green]"
+            if t.has_date_column
+            else "[dim]none[/dim]"
+        )
+        title = (t.section_title or "")[: 28] or "[dim]—[/dim]"
+        tbl.add_row(
+            str(t.table_index),
+            str(t.header_line_number),
+            str(t.column_count),
+            str(t.row_count),
+            str(len(t.subtotal_rows)),
+            date_info,
+            f"[{colour}]{label} ({t.confidence:.0%})[/{colour}]",
+            title,
+        )
+
+    log.console.print(tbl)
+
+
+def _print_table_details(det: TableDetectionResult, verbose: bool) -> None:
+    for t in det.tables:
+        log.blank()
+        title_part = f" — \"{t.section_title}\"" if t.section_title else ""
+        log.rule(f"Table {t.table_index}{title_part}")
+
+        # Column list (compact, 4 per row)
+        cols = t.header_row
+        rows_of_cols = [cols[i: i + 4] for i in range(0, len(cols), 4)]
+        for chunk in rows_of_cols:
+            log.console.print("  " + "   ".join(f"[dim]{i + rows_of_cols.index(chunk)*4}[/dim] [bold]{c}[/bold]" for i, c in enumerate(chunk)))
+
+        log.blank()
+
+        # Key column signals
+        signals = []
+        if t.has_spend_column:
+            signals.append(f"[green]spend→ {t.spend_column_name}[/green]")
+        else:
+            signals.append("[red]no spend col[/red]")
+        if t.has_delivery_column:
+            signals.append(f"[green]delivery→ {t.delivery_column_name}[/green]")
+        else:
+            signals.append("[red]no delivery col[/red]")
+        if t.has_date_column:
+            signals.append(f"[green]date→ {t.date_column_name}[/green]")
+        else:
+            signals.append("[yellow]no date col[/yellow]")
+        log.console.print("  Signals : " + "   ".join(signals))
+
+        # Line range
+        if t.start_line_number and t.end_line_number:
+            log.console.print(
+                f"  Lines   : {t.start_line_number}–{t.end_line_number}  "
+                f"({t.row_count} data rows, {len(t.subtotal_rows)} subtotals)"
+            )
+
+        # Confidence detail
+        conf_colour = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red", "VERY LOW": "bold red"}
+        colour = conf_colour.get(t.confidence_label, "white")
+        log.console.print(
+            f"  Confid. : [{colour}]{t.confidence_label} ({t.confidence:.0%})[/{colour}]"
+        )
+        if verbose:
+            for reason in t.confidence_reasons:
+                log.console.print(f"    [dim]· {reason}[/dim]")
+
+        # Warnings
+        sev_colour = {"info": "cyan", "warn": "yellow", "error": "red"}
+        for w in t.warnings:
+            c = sev_colour.get(w.severity, "white")
+            log.console.print(f"  [{c}]⚠ {w.message}[/{c}]")
 
 
 # ── map ───────────────────────────────────────────────────────────────────────

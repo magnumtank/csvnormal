@@ -104,8 +104,9 @@ class InspectResult(BaseModel):
 # ── Classification constants ──────────────────────────────────────────────────
 
 _SUBTOTAL_MARKERS: frozenset[str] = frozenset({
+    # "sum" / "summary" intentionally omitted — too likely to match column names
     "total", "subtotal", "grand total", "sub total", "totals",
-    "sum", "summary", "net total", "overall total", "combined total",
+    "net total", "overall total", "combined total",
     "search subtotal", "social subtotal", "display subtotal",
 })
 
@@ -151,13 +152,14 @@ def _non_empty(cells: list[str]) -> list[str]:
 
 def _cell_matches_subtotal(cell: str) -> bool:
     lower = cell.strip().lower()
-    # Exact match
+    # Exact match against known markers
     if lower in _SUBTOTAL_MARKERS:
         return True
-    # Word-boundary match — avoids "sum" matching inside "summer", etc.
+    # Prefix match — marker must be at the START of the cell.
+    # This avoids false positives like "Clicks (Total)" or "Summer Catalogue"
+    # where the marker word appears embedded, not as the row label.
     for marker in _SUBTOTAL_MARKERS:
-        pattern = r"\b" + re.escape(marker) + r"\b"
-        if re.search(pattern, lower) and len(lower) <= len(marker) + 20:
+        if lower.startswith(marker) and len(lower) <= len(marker) + 20:
             return True
     return False
 
